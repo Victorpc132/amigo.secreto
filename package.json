@@ -1,0 +1,15 @@
+{
+  "name": "amigo-secreto",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Amigo Secreto de Natal: leve, rápido e sem cadastro.",
+  "scripts": {
+    "start": "bun src/server.ts",
+    "dev": "bun --watch src/server.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
