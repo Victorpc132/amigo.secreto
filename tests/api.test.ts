@@ -1,7 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { createApp } from "../src/app";
 import { config } from "../src/config";
-import { openDb } from "../src/db";
+import { openDb, purgeOldGroups } from "../src/db";
+
+describe("retenção de grupos", () => {
+  test("0 mantém grupos antigos; um limite positivo os apaga", async () => {
+    const db = openDb(":memory:");
+    db.query(
+      "INSERT INTO groups (admin_token, invite_code, name, created_at) VALUES (?, ?, ?, ?)",
+    ).run("admin", "invite", "Antigo", 1);
+
+    expect(await purgeOldGroups(db, 0)).toBe(0);
+    expect(db.query("SELECT COUNT(*) AS count FROM groups").get()).toEqual({ count: 1 });
+    expect(await purgeOldGroups(db, 1)).toBe(1);
+    expect(db.query("SELECT COUNT(*) AS count FROM groups").get()).toEqual({ count: 0 });
+    db.close();
+  });
+});
 
 function setup(rateLimit = false) {
   const handle = createApp(openDb(":memory:"), config, { rateLimit });

@@ -1,25 +1,32 @@
 # Como colocar o site na internet
 
-## A regra mais importante
+## Onde os dados ficam
 
-Este site guarda tudo num arquivo (`amigo-secreto.db`). Então a hospedagem precisa ter **disco persistente** (também chamado de *volume*): uma pasta que **não é apagada** quando o site reinicia ou recebe uma versão nova.
+O app pode guardar os dados em um PostgreSQL externo ou em um arquivo SQLite local.
 
-Sem disco persistente, **todos os grupos somem** a cada reinício. Muitos planos gratuitos não têm esse disco, então confira antes de escolher. Não consegui verificar os preços atuais de nenhuma hospedagem, então olhe o site de cada uma.
+- Com `DATABASE_URL`, os grupos ficam no PostgreSQL e o serviço web não precisa de disco persistente.
+- Sem `DATABASE_URL`, o app usa `amigo-secreto.db`; a hospedagem precisa montar um **disco persistente** em `/data`, ou os grupos podem sumir quando o serviço reiniciar.
 
-## Caminho 1: hospedagem pronta (a mais fácil)
+Confira os limites e preços atuais diretamente com cada provedor.
 
-Serve **Render**, **Railway**, **Fly.io** ou parecidas. Todas aceitam o `Dockerfile` que já está no projeto.
+## Render + Neon (PostgreSQL externo)
 
-1. Crie uma conta no [GitHub](https://github.com) e envie esta pasta para um repositório (no VS Code: Controle de Código-Fonte → Publicar no GitHub).
-2. Na hospedagem escolhida, crie um novo serviço web a partir desse repositório. Ela detecta o `Dockerfile` sozinha.
-3. Adicione um **disco/volume** e monte ele na pasta `/data`.
-4. Confira estas variáveis (o `Dockerfile` já define, mas vale checar): `DATA_DIR=/data` e `TRUST_PROXY=true`.
-5. Faça o deploy. A hospedagem te dá um endereço (ex.: `meu-amigo-secreto.exemplo.app`).
-6. Abra o endereço, crie um grupo de teste e confira se ele continua lá depois de reiniciar o serviço.
+1. Crie um projeto PostgreSQL no Neon.
+2. No painel do Neon, abra **Connect** e copie a connection string. Use a URL fornecida pelo Neon, sem publicar ou enviar essa URL para ninguém.
+3. No Render, abra o serviço web e vá em **Environment**.
+4. Adicione `DATABASE_URL` com a connection string do Neon como valor secreto.
+5. Salve e faça o deploy. O app cria as tabelas necessárias na primeira inicialização; com `DATABASE_URL` configurada, não precisa de disco `/data`.
+6. Crie um grupo de teste, reinicie o serviço e confirme que os links continuam funcionando.
 
-Dica: o site responde em `/healthz`. Se a hospedagem pedir uma "rota de saúde", use essa.
+**Importante:** definir `DATABASE_URL` não importa os dados que já estavam no arquivo SQLite. Para manter grupos antigos, é preciso migrá-los antes; se o arquivo já foi perdido e não há backup, não há como recuperá-los.
 
-## Caminho 2: servidor próprio (VPS)
+## Outras hospedagens com SQLite local
+
+Render, Railway, Fly.io ou outras hospedagens que aceitem o `Dockerfile` também podem usar SQLite, desde que forneçam um disco/volume persistente montado em `/data`. Defina `DATA_DIR=/data` e `TRUST_PROXY=true`.
+
+O site responde em `/healthz`. Se a hospedagem pedir uma rota de saúde, use essa.
+
+## Servidor próprio (VPS)
 
 Se você tem um servidor Linux com [Docker](https://docs.docker.com/engine/install/):
 
@@ -34,9 +41,9 @@ O `-v amigo-data:/data` é o disco persistente. Para ter `https://` e um domíni
 
 ## Depois de publicar
 
-- **Backup:** copie de vez em quando o arquivo `/data/amigo-secreto.db`. Se for pouco uso, nem precisa.
-- **Atualizar o site:** envie o código novo para o GitHub; a hospedagem faz o deploy. Os grupos continuam, porque ficam no disco.
+- **Backup:** faça backup do banco. Com SQLite, copie `/data/amigo-secreto.db`; com Neon, use as opções de backup/exportação do provedor.
+- **Atualizar o site:** envie o código novo para o GitHub; a hospedagem faz o deploy. Com PostgreSQL externo ou disco persistente, os grupos continuam após o deploy.
 - **HTTPS:** hospedagens prontas já entregam. É necessário para o botão "Copiar link" funcionar em todos os navegadores.
 - **Domínio próprio:** opcional; todas as hospedagens permitem apontar um domínio seu.
 
-> O `Dockerfile` não foi testado aqui (esta máquina não tinha acesso à internet para baixar a imagem base). O site em si foi testado rodando de verdade com `bun`. Se o build falhar, me mande a mensagem de erro.
+> O build da imagem Docker não foi executado neste ambiente. Os testes do app e a checagem de tipos foram executados localmente.

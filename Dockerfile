@@ -3,12 +3,14 @@ FROM oven/bun:1-alpine
 
 WORKDIR /app
 
-# O site não tem dependências para instalar: só copiamos o código.
+# Instala o driver PostgreSQL usado quando DATABASE_URL está configurada.
 COPY package.json ./
+COPY bun.lock ./
+RUN bun install --production --frozen-lockfile
 COPY src ./src
 COPY public ./public
 
-# DATA_DIR é a pasta do banco de dados. Na hospedagem, monte o disco persistente em /data.
+# DATA_DIR é usado pelo SQLite local; com DATABASE_URL, os dados ficam no PostgreSQL externo.
 # TRUST_PROXY=true porque as hospedagens colocam um "porteiro" (proxy) na frente do site.
 ENV PORT=3000 \
     DATA_DIR=/data \

@@ -12,12 +12,11 @@ Site de amigo secreto leve, rápido e sem cadastro. Funciona bem no celular.
 2. Abra a pasta do projeto no VS Code, abra o terminal e rode:
 
 ```bash
+bun install
 bun run dev
 ```
 
 3. Abra http://localhost:3000 no navegador. Pronto!
-
-Não precisa de `bun install` para rodar. Se quiser as dicas automáticas do VS Code para TypeScript, rode `bun install` uma vez.
 
 Para testar o código: `bun test`.
 
@@ -29,7 +28,7 @@ Para testar o código: `bun test`.
 | `src/server.ts` | Liga o servidor |
 | `src/app.ts` | As rotas (criar grupo, entrar, sortear, mensagens...) e as proteções |
 | `src/draw.ts` | O sorteio |
-| `src/db.ts` | O banco de dados (SQLite, um único arquivo em `data/`) |
+| `src/db.ts` | O acesso aos bancos SQLite local e PostgreSQL |
 | `src/config.ts` | Configurações |
 | `tests/` | Testes automáticos |
 | `Dockerfile` | Receita para colocar o site na internet |
@@ -41,9 +40,10 @@ Se não definir nada, já funciona. Em hospedagem você pode definir:
 | Variável | Padrão | O que faz |
 |---|---|---|
 | `PORT` | `3000` | Porta do site |
-| `DATA_DIR` | `./data` | Pasta do banco de dados |
+| `DATA_DIR` | `./data` | Pasta do SQLite local, usada quando `DATABASE_URL` não está definida |
+| `DATABASE_URL` | — | URL de conexão de um PostgreSQL externo; quando definida, substitui o SQLite |
 | `TRUST_PROXY` | `false` | Use `true` na hospedagem, para o limitador de abuso ver o IP real |
-| `RETENTION_DAYS` | `180` | Grupos mais velhos que isso são apagados sozinhos |
+| `RETENTION_DAYS` | `0` | Dias até apagar grupos antigos; `0` desativa a limpeza automática |
 | `MAX_PARTICIPANTS` | `60` | Máximo de pessoas por grupo |
 
 ## Como a privacidade funciona
@@ -51,8 +51,8 @@ Se não definir nada, já funciona. Em hospedagem você pode definir:
 - Não existe login. Cada link tem um código longo e impossível de adivinhar.
 - O **link do organizador** controla o grupo: quem o tiver pode editar ou apagar. Não compartilhe.
 - O **link pessoal** de cada participante mostra só quem aquela pessoa tirou.
-- O resultado do sorteio fica guardado no banco de dados, no servidor. Quem administra o servidor (você, se hospedar) tecnicamente consegue ler o arquivo. Para uma turma de amigos e família isso costuma ser aceitável, mas vale saber.
-- Os grupos são apagados sozinhos depois de `RETENTION_DAYS` dias.
+- O resultado do sorteio fica guardado no banco de dados. Quem administra esse banco tecnicamente pode ler os dados. Para uma turma de amigos e família isso costuma ser aceitável, mas vale saber.
+- Por padrão, os grupos não expiram. Se definir `RETENTION_DAYS` como um número maior que zero, grupos mais antigos que esse limite serão apagados automaticamente.
 
 ## Colocar na internet
 

@@ -1,6 +1,5 @@
-import type { Database } from "bun:sqlite";
 import type { Config } from "./config";
-import { createRepo, type GroupRow, type PersonRow } from "./db";
+import { createRepo, type AppDatabase, type GroupRow, type PersonRow } from "./db";
 import { drawNames } from "./draw";
 import { RateLimiter } from "./ratelimit";
 import { StaticFiles } from "./static";
@@ -70,7 +69,7 @@ export interface AppOptions {
   rateLimit?: boolean;
 }
 
-export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
+export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}) {
   const repo = createRepo(db);
   const files = new StaticFiles(config.publicDir);
   const limiter = new RateLimiter();
@@ -108,15 +107,21 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
   const wishesOf = (v: unknown) => text(v, "as dicas de presente", { max: 300, multiline: true });
 
   /* ---------- buscas que já recusam links inválidos ---------- */
-  const adminGroup = (token: string): GroupRow =>
-    repo.groupByAdmin(token) ?? (() => { throw new HttpError(404, "Link do organizador inválido (ou o grupo foi apagado)."); })();
+  const adminGroup = async (token: string): Promise<GroupRow> => {
+    const group = await repo.groupByAdmin(token);
+    if (!group) throw new HttpError(404, "Link do organizador inválido (ou o grupo foi apagado).");
+    return group;
+  };
 
-  const inviteGroup = (code: string): GroupRow =>
-    repo.groupByInvite(code) ?? (() => { throw new HttpError(404, "Convite não encontrado (ou o grupo foi apagado)."); })();
+  const inviteGroup = async (code: string): Promise<GroupRow> => {
+    const group = await repo.groupByInvite(code);
+    if (!group) throw new HttpError(404, "Convite não encontrado (ou o grupo foi apagado).");
+    return group;
+  };
 
-  const meCtx = (token: string): { person: PersonRow; group: GroupRow } => {
-    const person = repo.personByToken(token);
-    const group = person ? repo.groupById(person.group_id) : null;
+  const meCtx = async (token: string): Promise<{ person: PersonRow; group: GroupRow }> => {
+    const person = await repo.personByToken(token);
+    const group = person ? await repo.groupById(person.group_id) : null;
     if (!person || !group) throw new HttpError(404, "Link inválido (ou o grupo foi apagado).");
     return { person, group };
   };
@@ -125,26 +130,33 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
     if (g.drawn_at) throw new HttpError(409, "O sorteio já foi feito. Refaça o sorteio se quiser mudar a lista.");
   };
 
-  const capacity = (g: GroupRow) => {
-    if (repo.listPeople(g.id).length >= config.maxParticipants) {
+  const capacity = async (g: GroupRow) => {
+    if ((await repo.listPeople(g.id)).length >= config.maxParticipants) {
       throw new HttpError(409, `O grupo já tem o máximo de ${config.maxParticipants} pessoas.`);
     }
   };
 
-  const mePayload = (p: PersonRow, g: GroupRow) => {
-    const giftee = p.giftee_id ? repo.personById(p.giftee_id) : null;
-    const giver = g.drawn_at ? repo.giverOf(p.id) : null;
+  const mePayload = async (p: PersonRow, g: GroupRow) => {
+    const [giftee, giver, people] = await Promise.all([
+      p.giftee_id ? repo.personById(p.giftee_id) : null,
+      g.drawn_at ? repo.giverOf(p.id) : null,
+      repo.listPeople(g.id),
+    ]);
+    const [unreadGiftee, unreadGiver] = await Promise.all([
+      giftee ? repo.unread(p.id, giftee.id) : 0,
+      giver ? repo.unread(p.id, giver.id) : 0,
+    ]);
     return {
       group: publicGroup(g),
       me: { name: p.name, wishes: p.wishes, isOrganizer: p.is_organizer === 1 },
-      count: repo.listPeople(g.id).length,
+      count: people.length,
       drawn: g.drawn_at !== null,
       revealed: p.revealed_at !== null,
       // O nome só sai daqui depois que a pessoa clicou em "revelar".
       giftee: p.revealed_at !== null && giftee ? { name: giftee.name, wishes: giftee.wishes } : null,
       unread: {
-        giftee: giftee ? repo.unread(p.id, giftee.id) : 0,
-        giver: giver ? repo.unread(p.id, giver.id) : 0,
+        giftee: unreadGiftee,
+        giver: unreadGiver,
       },
     };
   };
@@ -165,7 +177,7 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
             wishes: wishesOf(b.wishes),
           }
         : null;
-      const { group, person } = repo.createGroup(fields, organizer, nowSec());
+      const { group, person } = await repo.createGroup(fields, organizer, nowSec());
       return json({ adminToken: group.admin_token, inviteCode: group.invite_code, participantToken: person?.token ?? null }, 201);
     },
     { name: "create", max: 8, windowMs: 3_600_000 },
@@ -174,9 +186,9 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
   /* ================================================================ *
    *  CONVITE (qualquer pessoa com o link de convite)
    * ================================================================ */
-  route("GET", "/api/invite/:code", (c) => {
-    const g = inviteGroup(c.params.code!);
-    return json({ group: publicGroup(g), count: repo.listPeople(g.id).length });
+  route("GET", "/api/invite/:code", async (c) => {
+    const g = await inviteGroup(c.params.code!);
+    return json({ group: publicGroup(g), count: (await repo.listPeople(g.id)).length });
   });
 
   route(
@@ -184,11 +196,11 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
     "/api/invite/:code/join",
     async (c) => {
       const b = await c.body();
-      const g = inviteGroup(c.params.code!);
+      const g = await inviteGroup(c.params.code!);
       notDrawn(g);
-      capacity(g);
+      await capacity(g);
       const name = text(b.name, "seu nome", { min: 1, max: 40 });
-      const person = repo.addPerson(g.id, name, wishesOf(b.wishes), false, nowSec());
+      const person = await repo.addPerson(g.id, name, wishesOf(b.wishes), false, nowSec());
       return json({ participantToken: person.token }, 201);
     },
     { name: "join", max: 20, windowMs: 3_600_000 },
@@ -197,12 +209,13 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
   /* ================================================================ *
    *  ORGANIZADOR
    * ================================================================ */
-  route("GET", "/api/admin/:token", (c) => {
-    const g = adminGroup(c.params.token!);
+  route("GET", "/api/admin/:token", async (c) => {
+    const g = await adminGroup(c.params.token!);
+    const [people, exclusions] = await Promise.all([repo.listPeople(g.id), repo.listExclusions(g.id)]);
     return json({
       group: { ...publicGroup(g), inviteCode: g.invite_code },
       // Repare: NÃO enviamos quem tirou quem. O organizador também não pode saber.
-      participants: repo.listPeople(g.id).map((p) => ({
+      participants: people.map((p) => ({
         id: p.id,
         name: p.name,
         wishes: p.wishes,
@@ -210,45 +223,45 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
         isOrganizer: p.is_organizer === 1,
         revealed: p.revealed_at !== null,
       })),
-      exclusions: repo.listExclusions(g.id),
+      exclusions,
     });
   });
 
   route("PATCH", "/api/admin/:token", async (c) => {
     const b = await c.body();
-    const g = adminGroup(c.params.token!);
-    repo.updateGroup(g.id, groupFields(b, g));
+    const g = await adminGroup(c.params.token!);
+    await repo.updateGroup(g.id, groupFields(b, g));
     return json({ ok: true });
   });
 
-  route("DELETE", "/api/admin/:token", (c) => {
-    repo.deleteGroup(adminGroup(c.params.token!).id);
+  route("DELETE", "/api/admin/:token", async (c) => {
+    await repo.deleteGroup((await adminGroup(c.params.token!)).id);
     return json({ ok: true });
   });
 
   route("POST", "/api/admin/:token/participants", async (c) => {
     const b = await c.body();
-    const g = adminGroup(c.params.token!);
+    const g = await adminGroup(c.params.token!);
     notDrawn(g);
-    capacity(g);
+    await capacity(g);
     const name = text(b.name, "o nome", { min: 1, max: 40 });
-    repo.addPerson(g.id, name, wishesOf(b.wishes), false, nowSec());
+    await repo.addPerson(g.id, name, wishesOf(b.wishes), false, nowSec());
     return json({ ok: true }, 201);
   });
 
-  route("DELETE", "/api/admin/:token/participants/:id", (c) => {
-    const g = adminGroup(c.params.token!);
+  route("DELETE", "/api/admin/:token/participants/:id", async (c) => {
+    const g = await adminGroup(c.params.token!);
     notDrawn(g);
-    if (!repo.removePerson(Number(c.params.id), g.id)) throw new HttpError(404, "Participante não encontrado.");
+    if (!(await repo.removePerson(Number(c.params.id), g.id))) throw new HttpError(404, "Participante não encontrado.");
     return json({ ok: true });
   });
 
   route("PUT", "/api/admin/:token/exclusions", async (c) => {
     const b = await c.body();
-    const g = adminGroup(c.params.token!);
+    const g = await adminGroup(c.params.token!);
     notDrawn(g);
     if (!Array.isArray(b.pairs) || b.pairs.length > 200) throw new HttpError(400, "Pedido inválido.");
-    const valid = new Set(repo.listPeople(g.id).map((p) => p.id));
+    const valid = new Set((await repo.listPeople(g.id)).map((p) => p.id));
     const seen = new Set<string>();
     const pairs: Array<[number, number]> = [];
     for (const raw of b.pairs as unknown[]) {
@@ -264,66 +277,69 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
         pairs.push([a, z]);
       }
     }
-    repo.setExclusions(g.id, pairs);
+    await repo.setExclusions(g.id, pairs);
     return json({ ok: true });
   });
 
-  route("POST", "/api/admin/:token/draw", (c) => {
-    const g = adminGroup(c.params.token!);
+  route("POST", "/api/admin/:token/draw", async (c) => {
+    const g = await adminGroup(c.params.token!);
     notDrawn(g);
-    const people = repo.listPeople(g.id);
+    const people = await repo.listPeople(g.id);
     if (people.length < 3) throw new HttpError(422, "Precisa de pelo menos 3 pessoas para sortear.");
-    const result = drawNames(people.map((p) => p.id), repo.listExclusions(g.id));
+    const result = drawNames(people.map((p) => p.id), await repo.listExclusions(g.id));
     if (!result) {
       throw new HttpError(422, "Com essas restrições não dá para sortear. Tire alguma restrição e tente de novo.");
     }
-    repo.applyDraw(g.id, result, nowSec());
+    await repo.applyDraw(g.id, result, nowSec());
     return json({ ok: true });
   });
 
-  route("POST", "/api/admin/:token/reset", (c) => {
-    const g = adminGroup(c.params.token!);
-    repo.resetDraw(g.id);
+  route("POST", "/api/admin/:token/reset", async (c) => {
+    const g = await adminGroup(c.params.token!);
+    await repo.resetDraw(g.id);
     return json({ ok: true });
   });
 
   /* ================================================================ *
    *  PARTICIPANTE (link pessoal)
    * ================================================================ */
-  route("GET", "/api/me/:token", (c) => {
-    const { person, group } = meCtx(c.params.token!);
-    return json(mePayload(person, group));
+  route("GET", "/api/me/:token", async (c) => {
+    const { person, group } = await meCtx(c.params.token!);
+    return json(await mePayload(person, group));
   });
 
   route("PATCH", "/api/me/:token", async (c) => {
     const b = await c.body();
-    const { person } = meCtx(c.params.token!);
-    repo.setWishes(person.id, wishesOf(b.wishes));
+    const { person } = await meCtx(c.params.token!);
+    await repo.setWishes(person.id, wishesOf(b.wishes));
     return json({ ok: true });
   });
 
-  route("POST", "/api/me/:token/reveal", (c) => {
-    const { person, group } = meCtx(c.params.token!);
+  route("POST", "/api/me/:token/reveal", async (c) => {
+    const { person, group } = await meCtx(c.params.token!);
     if (!group.drawn_at || !person.giftee_id) throw new HttpError(409, "O sorteio ainda não foi feito.");
-    repo.reveal(person.id, nowSec());
-    const fresh = repo.personByToken(c.params.token!)!;
-    return json(mePayload(fresh, group));
+    await repo.reveal(person.id, nowSec());
+    const fresh = (await repo.personByToken(c.params.token!))!;
+    return json(await mePayload(fresh, group));
   });
 
-  route("GET", "/api/me/:token/messages", (c) => {
-    const { person, group } = meCtx(c.params.token!);
+  route("GET", "/api/me/:token/messages", async (c) => {
+    const { person, group } = await meCtx(c.params.token!);
     if (!group.drawn_at) throw new HttpError(409, "O sorteio ainda não foi feito.");
-    const giftee = person.giftee_id ? repo.personById(person.giftee_id) : null;
-    const giver = repo.giverOf(person.id);
+    const [giftee, giver] = await Promise.all([
+      person.giftee_id ? repo.personById(person.giftee_id) : null,
+      repo.giverOf(person.id),
+    ]);
     // Só devolvemos "minha" ou "do outro": ninguém descobre identidades por aqui.
-    const view = (other: PersonRow | null) =>
+    const view = async (other: PersonRow | null) =>
       other
-        ? repo.thread(person.id, other.id).map((m) => ({ mine: m.from_id === person.id, body: m.body, at: m.created_at }))
+        ? (await repo.thread(person.id, other.id)).map((m) => ({ mine: m.from_id === person.id, body: m.body, at: m.created_at }))
         : [];
     const which = c.url.searchParams.get("thread");
-    if (which === "giftee" && giftee) repo.markRead(person.id, giftee.id, nowSec());
-    if (which === "giver" && giver) repo.markRead(person.id, giver.id, nowSec());
-    return json({ giftee: view(giftee), giver: view(giver) });
+    if (which === "giftee" && giftee) await repo.markRead(person.id, giftee.id, nowSec());
+    if (which === "giver" && giver) await repo.markRead(person.id, giver.id, nowSec());
+    const [gifteeMessages, giverMessages] = await Promise.all([view(giftee), view(giver)]);
+    return json({ giftee: gifteeMessages, giver: giverMessages });
   });
 
   route(
@@ -331,13 +347,18 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
     "/api/me/:token/messages",
     async (c) => {
       const b = await c.body();
-      const { person, group } = meCtx(c.params.token!);
+      const { person, group } = await meCtx(c.params.token!);
       if (!group.drawn_at) throw new HttpError(409, "O sorteio ainda não foi feito.");
       if (b.thread !== "giftee" && b.thread !== "giver") throw new HttpError(400, "Pedido inválido.");
       const body = text(b.body, "a mensagem", { min: 1, max: 500, multiline: true });
-      const other = b.thread === "giftee" ? (person.giftee_id ? repo.personById(person.giftee_id) : null) : repo.giverOf(person.id);
+      const other =
+        b.thread === "giftee"
+          ? person.giftee_id
+            ? await repo.personById(person.giftee_id)
+            : null
+          : await repo.giverOf(person.id);
       if (!other) throw new HttpError(409, "Conversa indisponível.");
-      repo.addMessage(group.id, person.id, other.id, body, nowSec());
+      await repo.addMessage(group.id, person.id, other.id, body, nowSec());
       return json({ ok: true }, 201);
     },
     { name: "msg", max: 40, windowMs: 600_000 },
@@ -378,7 +399,7 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
     let description = "Crie seu grupo, sorteie e descubra quem você tirou. Grátis, rápido e sem cadastro.";
     const invite = /^\/g\/([^/]+)\/?$/.exec(path);
     if (invite) {
-      const g = repo.groupByInvite(invite[1]!);
+      const g = await repo.groupByInvite(invite[1]!);
       if (g) {
         title = `Amigo Secreto: ${g.name}`;
         description = "Você foi convidado! Entre no grupo e deixe suas dicas de presente.";
@@ -438,7 +459,7 @@ export function createApp(db: Database, config: Config, opts: AppOptions = {}) {
     try {
       if (path.startsWith("/api/")) res = await handleApi(req, url, path, ip);
       else if (path === "/healthz") {
-        repo.ping();
+        await repo.ping();
         res = new Response("ok", { headers: { "cache-control": "no-store" } });
       } else res = await handlePage(req, path);
     } catch (e) {
