@@ -2,6 +2,47 @@ import { describe, expect, test } from "bun:test";
 import { createApp } from "../src/app";
 import { config } from "../src/config";
 import { openDb, purgeOldGroups } from "../src/db";
+import { normalizeWhatsApp } from "../src/util";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+describe("WhatsApp e migrações", () => {
+  test("normaliza Brasil local e números internacionais e rejeita entradas inválidas", () => {
+    expect(normalizeWhatsApp("(11) 99999-1234")).toBe("5511999991234");
+    expect(normalizeWhatsApp("+55 21 3333-4444")).toBe("552133334444");
+    expect(normalizeWhatsApp("+1 (415) 555-2671")).toBe("14155552671");
+    expect(normalizeWhatsApp("")).toBe("");
+    expect(() => normalizeWhatsApp("telefone da Ana")).toThrow();
+    expect(() => normalizeWhatsApp("+55 123")).toThrow();
+    expect(() => normalizeWhatsApp(123)).toThrow();
+  });
+
+  test("migra banco SQLite legado e pode abrir novamente sem duplicar a coluna", () => {
+    const dir = mkdtempSync(join(tmpdir(), "amigo-secreto-migration-"));
+    const path = join(dir, "legacy.sqlite");
+    const legacy = new Database(path, { create: true });
+    legacy.exec(`
+      CREATE TABLE groups (id INTEGER PRIMARY KEY);
+      CREATE TABLE participants (
+        id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL, token TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL, name_key TEXT NOT NULL, wishes TEXT NOT NULL DEFAULT '',
+        is_organizer INTEGER NOT NULL DEFAULT 0, giftee_id INTEGER,
+        revealed_at INTEGER, created_at INTEGER NOT NULL, UNIQUE (group_id, name_key)
+      );
+    `);
+    legacy.close();
+
+    const db = openDb(path);
+    expect((db.query("PRAGMA table_info(participants)").all() as Array<{ name: string }>).some((c) => c.name === "phone")).toBe(true);
+    db.close();
+    const reopened = openDb(path);
+    expect((reopened.query("PRAGMA table_info(participants)").all() as Array<{ name: string }>).filter((c) => c.name === "phone")).toHaveLength(1);
+    reopened.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
 
 describe("retenção de grupos", () => {
   test("0 mantém grupos antigos; um limite positivo os apaga", async () => {
@@ -19,7 +60,8 @@ describe("retenção de grupos", () => {
 });
 
 function setup(rateLimit = false, maxParticipants = config.maxParticipants) {
-  const handle = createApp(openDb(":memory:"), { ...config, maxParticipants }, { rateLimit });
+  const db = openDb(":memory:");
+  const handle = createApp(db, { ...config, maxParticipants }, { rateLimit });
   const call = async (method: string, path: string, body?: unknown, ip = "9.9.9.9") => {
     const res = await handle(
       new Request(`http://teste${path}`, {
@@ -47,10 +89,73 @@ function setup(rateLimit = false, maxParticipants = config.maxParticipants) {
     return { adminToken, inviteCode, tokens };
   };
 
-  return { call, makeGroup };
+  return { call, makeGroup, db };
 }
 
 describe("fluxo completo", () => {
+  test("sorteio concorrente com entrada e remoção deixa resultado para todos os participantes finais", async () => {
+    const { call, makeGroup, db } = setup();
+    const { adminToken, inviteCode } = await makeGroup(["Ana", "Bruno", "Carla"]);
+    const before = await call("GET", `/api/admin/${adminToken}`);
+    const anaId = before.data.participants.find((p: any) => p.name === "Ana").id;
+
+    const [draw, join, remove] = await Promise.all([
+      call("POST", `/api/admin/${adminToken}/draw`),
+      call("POST", `/api/invite/${inviteCode}/join`, { name: "Davi" }),
+      call("DELETE", `/api/admin/${adminToken}/participants/${anaId}`),
+    ]);
+
+    expect(draw.status).toBe(200);
+    expect([201, 409]).toContain(join.status);
+    expect([200, 409]).toContain(remove.status);
+    const group = db.query("SELECT id, drawn_at FROM groups WHERE admin_token = ?").get(adminToken) as { id: number; drawn_at: number | null };
+    expect(group.drawn_at).not.toBeNull();
+    const results = db.query("SELECT COUNT(*) AS total, SUM(CASE WHEN giftee_id IS NOT NULL THEN 1 ELSE 0 END) AS assigned FROM participants WHERE group_id = ?").get(group.id) as { total: number; assigned: number };
+    expect(results.total).toBeGreaterThanOrEqual(3);
+    expect(results.assigned).toBe(results.total);
+  });
+
+  test("salva contato opcional, mostra apenas ao participante e organizador, e permite atualizar ou apagar", async () => {
+    const { call } = setup();
+    const created = await call("POST", "/api/groups", {
+      name: "Natal seguro", organizerName: "Victor", phone: "(11) 99999-1234",
+    });
+    const { adminToken, inviteCode, participantToken } = created.data;
+    const joined = await call("POST", `/api/invite/${inviteCode}/join`, { name: "Ana", phone: "+1 (415) 555-2671" });
+    const anaToken = joined.data.participantToken;
+
+    const invite = await call("GET", `/api/invite/${inviteCode}`);
+    expect(JSON.stringify(invite.data)).not.toContain("5511999991234");
+    expect(JSON.stringify(invite.data)).not.toContain("14155552671");
+
+    const ownerProfile = await call("GET", `/api/me/${participantToken}`);
+    expect(ownerProfile.data.me.phone).toBe("5511999991234");
+    const anaProfile = await call("GET", `/api/me/${anaToken}`);
+    expect(anaProfile.data.me.phone).toBe("14155552671");
+    expect(JSON.stringify(anaProfile.data)).not.toContain("5511999991234");
+
+    const admin = await call("GET", `/api/admin/${adminToken}`);
+    expect(admin.data.participants.find((p: any) => p.name === "Victor").phone).toBe("5511999991234");
+    expect(admin.data.participants.find((p: any) => p.name === "Ana").phone).toBe("14155552671");
+
+    const changed = await call("PATCH", `/api/me/${anaToken}`, { phone: "21 3333-4444" });
+    expect(changed.data.phone).toBe("552133334444");
+    expect((await call("GET", `/api/me/${anaToken}`)).data.me.phone).toBe("552133334444");
+    const erased = await call("PATCH", `/api/me/${anaToken}`, { phone: "" });
+    expect(erased.data.phone).toBe("");
+  });
+
+  test("telefone pode ser salvo na inclusão manual e números inválidos são recusados", async () => {
+    const { call, makeGroup } = setup();
+    const { adminToken } = await makeGroup(["Ana", "Bruno"]);
+    const added = await call("POST", `/api/admin/${adminToken}/participants`, { name: "Carla", phone: "31 98888-7777" });
+    expect(added.status).toBe(201);
+    const panel = await call("GET", `/api/admin/${adminToken}`);
+    expect(panel.data.participants.find((p: any) => p.name === "Carla").phone).toBe("5531988887777");
+    expect((await call("POST", `/api/admin/${adminToken}/participants`, { name: "Davi", phone: "123" })).status).toBe(400);
+    expect((await call("POST", `/api/invite/${panel.data.group.inviteCode}/join`, { name: "Eva", phone: "12abc" })).status).toBe(400);
+  });
+
   test("participante removido perde o link pessoal e pode entrar novamente pelo convite", async () => {
     const { call, makeGroup } = setup();
     const { adminToken, inviteCode, tokens } = await makeGroup();

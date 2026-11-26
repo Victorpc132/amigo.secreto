@@ -47,6 +47,32 @@ export function text(value: unknown, label: string, rules: TextRules): string {
   return s;
 }
 
+/** Normaliza números para o formato de dígitos esperado por wa.me. */
+export function normalizeWhatsApp(value: unknown): string {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value !== "string") throw new HttpError(400, "Número de WhatsApp inválido.");
+  const raw = value.trim();
+  if (!raw) return "";
+  if (raw.length > 32 || !/^\+?[\d\s().-]+$/.test(raw)) {
+    throw new HttpError(400, "Número de WhatsApp inválido. Use DDD + número ou inclua o código do país.");
+  }
+
+  let digits = raw.replace(/\D/g, "");
+  const explicitCountryCode = raw.startsWith("+");
+  if (!explicitCountryCode && (digits.length === 10 || digits.length === 11)) {
+    digits = `55${digits}`;
+  } else if (digits.startsWith("55") && (digits.length === 12 || digits.length === 13)) {
+    // Número brasileiro já informado com DDI.
+  } else if (digits.startsWith("55")) {
+    throw new HttpError(400, "Número brasileiro inválido. Confira o DDD e o número.");
+  }
+
+  if (digits.length < 8 || digits.length > 15 || digits.startsWith("0")) {
+    throw new HttpError(400, "Número de WhatsApp inválido. Informe um número internacional válido.");
+  }
+  return digits;
+}
+
 /** Aceita "" (sem data) ou uma data real no formato AAAA-MM-DD. */
 export function isoDate(value: unknown): string {
   if (value === undefined || value === null || value === "") return "";

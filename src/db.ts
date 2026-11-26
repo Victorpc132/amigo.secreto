@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS participants (
   name         TEXT    NOT NULL,
   name_key     TEXT    NOT NULL,
   wishes       TEXT    NOT NULL DEFAULT '',
+  phone        TEXT    NOT NULL DEFAULT '',
   is_organizer INTEGER NOT NULL DEFAULT 0,
   giftee_id    INTEGER REFERENCES participants(id) ON DELETE SET NULL,
   revealed_at  INTEGER,
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS participants (
   name         TEXT    NOT NULL,
   name_key     TEXT    NOT NULL,
   wishes       TEXT    NOT NULL DEFAULT '',
+  phone        TEXT    NOT NULL DEFAULT '',
   is_organizer INTEGER NOT NULL DEFAULT 0,
   giftee_id    INTEGER REFERENCES participants(id) ON DELETE SET NULL,
   revealed_at  INTEGER,
@@ -124,6 +126,7 @@ export interface PersonRow {
   name: string;
   name_key: string;
   wishes: string;
+  phone: string;
   is_organizer: number;
   giftee_id: number | null;
   revealed_at: number | null;
@@ -159,6 +162,10 @@ export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
   db.exec(SQLITE_SCHEMA);
+  const participantColumns = db.query("PRAGMA table_info(participants)").all() as Array<{ name: string }> ;
+  if (!participantColumns.some((column) => column.name === "phone")) {
+    db.exec("ALTER TABLE participants ADD COLUMN phone TEXT NOT NULL DEFAULT ''");
+  }
   return db;
 }
 
@@ -175,6 +182,7 @@ export async function openPostgresDb(url: string): Promise<PostgresDatabase> {
     for (const statement of POSTGRES_SCHEMA.split(";").map((part) => part.trim()).filter(Boolean)) {
       await sql.unsafe(statement);
     }
+    await sql.unsafe("ALTER TABLE participants ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT ''");
   } catch (error) {
     await db.close();
     throw error;
@@ -215,20 +223,21 @@ function uniqueNameError(error: unknown): HttpError | null {
 }
 
 const INSERT_PERSON =
-  "INSERT INTO participants (group_id, token, name, name_key, wishes, is_organizer, created_at) VALUES (?,?,?,?,?,?,?) RETURNING *";
+  "INSERT INTO participants (group_id, token, name, name_key, wishes, phone, is_organizer, created_at) VALUES (?,?,?,?,?,?,?,?) RETURNING *";
 
 function addPersonSqlite(
   db: Database,
   groupId: number,
   name: string,
   wishes: string,
+  phone: string,
   isOrganizer: boolean,
   ts: number,
 ): PersonRow {
   try {
     return db
       .query(INSERT_PERSON)
-      .get(groupId, newToken(), name, nameKey(name), wishes, isOrganizer ? 1 : 0, ts) as PersonRow;
+      .get(groupId, newToken(), name, nameKey(name), wishes, phone, isOrganizer ? 1 : 0, ts) as PersonRow;
   } catch (error) {
     const mapped = uniqueNameError(error);
     if (mapped) throw mapped;
@@ -241,13 +250,14 @@ async function addPersonPostgres(
   groupId: number,
   name: string,
   wishes: string,
+  phone: string,
   isOrganizer: boolean,
   ts: number,
 ): Promise<PersonRow> {
   try {
     const rows = await sql.unsafe<Row[]>(
       toPostgresPlaceholders(INSERT_PERSON),
-      [groupId, newToken(), name, nameKey(name), wishes, isOrganizer ? 1 : 0, ts],
+      [groupId, newToken(), name, nameKey(name), wishes, phone, isOrganizer ? 1 : 0, ts],
     );
     return rows[0] as unknown as PersonRow;
   } catch (error) {
@@ -268,7 +278,7 @@ export const MAX_MESSAGES_PER_DIRECTION = 100;
 export function createRepo(db: AppDatabase) {
   const createGroup = async (
     fields: GroupFields,
-    organizer: { name: string; wishes: string } | null,
+    organizer: { name: string; wishes: string; phone: string } | null,
     ts: number,
   ): Promise<{ group: GroupRow; person: PersonRow | null }> => {
     const values: DbValue[] = [
@@ -288,7 +298,7 @@ export function createRepo(db: AppDatabase) {
       return db.transaction(() => {
         const group = db.query(insertGroup).get(...values) as GroupRow;
         const person = organizer
-          ? addPersonSqlite(db, group.id, organizer.name, organizer.wishes, true, ts)
+          ? addPersonSqlite(db, group.id, organizer.name, organizer.wishes, organizer.phone, true, ts)
           : null;
         return { group, person };
       })();
@@ -298,7 +308,7 @@ export function createRepo(db: AppDatabase) {
       const groups = await tx.unsafe<Row[]>(toPostgresPlaceholders(insertGroup), values);
       const group = groups[0] as unknown as GroupRow;
       const person = organizer
-        ? await addPersonPostgres(tx, group.id, organizer.name, organizer.wishes, true, ts)
+        ? await addPersonPostgres(tx, group.id, organizer.name, organizer.wishes, organizer.phone, true, ts)
         : null;
       return { group, person };
     });
@@ -307,14 +317,29 @@ export function createRepo(db: AppDatabase) {
   const setExclusions = async (groupId: number, pairs: Array<[number, number]>): Promise<void> => {
     if (!isPostgres(db)) {
       db.transaction(() => {
+        const group = db.query("SELECT drawn_at FROM groups WHERE id = ?").get(groupId) as { drawn_at: number | null } | null;
+        if (!group) throw new HttpError(404, "Grupo não encontrado.");
+        if (group.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
+        const validIds = new Set((db.query("SELECT id FROM participants WHERE group_id = ?").all(groupId) as Array<{ id: number }>).map((p) => p.id));
+        if (pairs.some(([a, b]) => !validIds.has(a) || !validIds.has(b))) {
+          throw new HttpError(409, "A lista de participantes mudou. Atualize e tente novamente.");
+        }
         db.query("DELETE FROM exclusions WHERE group_id = ?").run(groupId);
         const insert = db.query("INSERT INTO exclusions (group_id, a_id, b_id) VALUES (?,?,?) ON CONFLICT DO NOTHING");
         for (const [a, b] of pairs) insert.run(groupId, a, b);
-      })();
+      }).immediate();
       return;
     }
 
     await db.sql.begin(async (tx) => {
+      const groups = await tx.unsafe<Row[]>("SELECT drawn_at FROM groups WHERE id = $1 FOR UPDATE", [groupId]);
+      if (!groups.length) throw new HttpError(404, "Grupo não encontrado.");
+      if (groups[0]!.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
+      const people = await tx.unsafe<Row[]>("SELECT id FROM participants WHERE group_id = $1", [groupId]);
+      const validIds = new Set(people.map((p) => Number(p.id)));
+      if (pairs.some(([a, b]) => !validIds.has(a) || !validIds.has(b))) {
+        throw new HttpError(409, "A lista de participantes mudou. Atualize e tente novamente.");
+      }
       await tx.unsafe("DELETE FROM exclusions WHERE group_id = $1", [groupId]);
       for (const [a, b] of pairs) {
         await tx.unsafe("INSERT INTO exclusions (group_id, a_id, b_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [
@@ -326,35 +351,59 @@ export function createRepo(db: AppDatabase) {
     });
   };
 
-  const applyDraw = async (groupId: number, assignment: Map<number, number>, ts: number): Promise<void> => {
+  const drawGroup = async (
+    groupId: number,
+    ts: number,
+    chooseAssignment: (people: number[], exclusions: Array<[number, number]>) => Map<number, number> | null,
+  ): Promise<void> => {
     if (!isPostgres(db)) {
       db.transaction(() => {
+        const group = db.query("SELECT drawn_at FROM groups WHERE id = ?").get(groupId) as { drawn_at: number | null } | null;
+        if (!group) throw new HttpError(404, "Grupo não encontrado.");
+        if (group.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
+        const people = (db.query("SELECT id FROM participants WHERE group_id = ? ORDER BY id").all(groupId) as Array<{ id: number }>).map((p) => p.id);
+        if (people.length < 3) throw new HttpError(422, "Precisa de pelo menos 3 pessoas para sortear.");
+        const exclusions = (db.query("SELECT a_id, b_id FROM exclusions WHERE group_id = ?").all(groupId) as Array<{ a_id: number; b_id: number }>).map((e): [number, number] => [e.a_id, e.b_id]);
+        const assignment = chooseAssignment(people, exclusions);
+        if (!assignment) throw new HttpError(422, "Com essas restrições não dá para sortear. Tire alguma restrição e tente de novo.");
         const setGiftee = db.query("UPDATE participants SET giftee_id = ?, revealed_at = NULL WHERE id = ?");
         for (const [giver, giftee] of assignment) setGiftee.run(giftee, giver);
-        db.query("UPDATE groups SET drawn_at = ? WHERE id = ?").run(ts, groupId);
-      })();
+        db.query("UPDATE groups SET drawn_at = ? WHERE id = ? AND drawn_at IS NULL").run(ts, groupId);
+      }).immediate();
       return;
     }
 
     await db.sql.begin(async (tx) => {
+      const groups = await tx.unsafe<Row[]>("SELECT drawn_at FROM groups WHERE id = $1 FOR UPDATE", [groupId]);
+      if (!groups.length) throw new HttpError(404, "Grupo não encontrado.");
+      if (groups[0]!.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
+      const rows = await tx.unsafe<Row[]>("SELECT id FROM participants WHERE group_id = $1 ORDER BY id", [groupId]);
+      const people = rows.map((p) => Number(p.id));
+      if (people.length < 3) throw new HttpError(422, "Precisa de pelo menos 3 pessoas para sortear.");
+      const exclusionRows = await tx.unsafe<Row[]>("SELECT a_id, b_id FROM exclusions WHERE group_id = $1", [groupId]);
+      const exclusions = exclusionRows.map((e): [number, number] => [Number(e.a_id), Number(e.b_id)]);
+      const assignment = chooseAssignment(people, exclusions);
+      if (!assignment) throw new HttpError(422, "Com essas restrições não dá para sortear. Tire alguma restrição e tente de novo.");
       for (const [giver, giftee] of assignment) {
         await tx.unsafe("UPDATE participants SET giftee_id = $1, revealed_at = NULL WHERE id = $2", [giftee, giver]);
       }
-      await tx.unsafe("UPDATE groups SET drawn_at = $1 WHERE id = $2", [ts, groupId]);
+      await tx.unsafe("UPDATE groups SET drawn_at = $1 WHERE id = $2 AND drawn_at IS NULL", [ts, groupId]);
     });
   };
 
   const resetDraw = async (groupId: number): Promise<void> => {
     if (!isPostgres(db)) {
       db.transaction(() => {
+        db.query("SELECT id FROM groups WHERE id = ?").get(groupId);
         db.query("UPDATE participants SET giftee_id = NULL, revealed_at = NULL WHERE group_id = ?").run(groupId);
         db.query("DELETE FROM messages WHERE group_id = ?").run(groupId);
         db.query("UPDATE groups SET drawn_at = NULL WHERE id = ?").run(groupId);
-      })();
+      }).immediate();
       return;
     }
 
     await db.sql.begin(async (tx) => {
+      await tx.unsafe("SELECT id FROM groups WHERE id = $1 FOR UPDATE", [groupId]);
       await tx.unsafe("UPDATE participants SET giftee_id = NULL, revealed_at = NULL WHERE group_id = $1", [groupId]);
       await tx.unsafe("DELETE FROM messages WHERE group_id = $1", [groupId]);
       await tx.unsafe("UPDATE groups SET drawn_at = NULL WHERE id = $1", [groupId]);
@@ -363,14 +412,15 @@ export function createRepo(db: AppDatabase) {
 
   return {
     createGroup,
-    addPerson: (groupId: number, name: string, wishes: string, isOrganizer: boolean, ts: number) =>
+    addPerson: (groupId: number, name: string, wishes: string, phone: string, isOrganizer: boolean, ts: number) =>
       isPostgres(db)
-        ? addPersonPostgres(db.sql, groupId, name, wishes, isOrganizer, ts)
-        : Promise.resolve(addPersonSqlite(db, groupId, name, wishes, isOrganizer, ts)),
+        ? addPersonPostgres(db.sql, groupId, name, wishes, phone, isOrganizer, ts)
+        : Promise.resolve(addPersonSqlite(db, groupId, name, wishes, phone, isOrganizer, ts)),
     addPersonWithinLimit: async (
       groupId: number,
       name: string,
       wishes: string,
+      phone: string,
       isOrganizer: boolean,
       ts: number,
       maxParticipants: number,
@@ -378,25 +428,29 @@ export function createRepo(db: AppDatabase) {
       const fullError = () => new HttpError(409, `O grupo já tem o máximo de ${maxParticipants} pessoas.`);
       if (!isPostgres(db)) {
         return db.transaction(() => {
+          const group = db.query("SELECT drawn_at FROM groups WHERE id = ?").get(groupId) as { drawn_at: number | null } | null;
+          if (!group) throw new HttpError(404, "Convite não encontrado (ou o grupo foi apagado).");
+          if (group.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
           const row = db.query("SELECT COUNT(*) AS n FROM participants WHERE group_id = ?").get(groupId) as { n: number };
           if (row.n >= maxParticipants) throw fullError();
-          return addPersonSqlite(db, groupId, name, wishes, isOrganizer, ts);
-        })();
+          return addPersonSqlite(db, groupId, name, wishes, phone, isOrganizer, ts);
+        }).immediate();
       }
 
       return db.sql.begin(async (tx) => {
-        const groups = await tx.unsafe<Row[]>("SELECT id FROM groups WHERE id = $1 FOR UPDATE", [groupId]);
+        const groups = await tx.unsafe<Row[]>("SELECT drawn_at FROM groups WHERE id = $1 FOR UPDATE", [groupId]);
         if (!groups.length) throw new HttpError(404, "Convite não encontrado (ou o grupo foi apagado).");
+        if (groups[0]!.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
         const rows = await tx.unsafe<Row[]>(
           "SELECT CAST(COUNT(*) AS INTEGER) AS n FROM participants WHERE group_id = $1",
           [groupId],
         );
         if (Number(rows[0]?.n ?? 0) >= maxParticipants) throw fullError();
-        return addPersonPostgres(tx, groupId, name, wishes, isOrganizer, ts);
+        return addPersonPostgres(tx, groupId, name, wishes, phone, isOrganizer, ts);
       });
     },
     setExclusions,
-    applyDraw,
+    drawGroup,
     resetDraw,
     groupByAdmin: (token: string) => queryOne<GroupRow>(db, "SELECT * FROM groups WHERE admin_token = ?", [token]),
     groupByInvite: (code: string) => queryOne<GroupRow>(db, "SELECT * FROM groups WHERE invite_code = ?", [code]),
@@ -421,10 +475,28 @@ export function createRepo(db: AppDatabase) {
     personById: (id: number) => queryOne<PersonRow>(db, "SELECT * FROM participants WHERE id = ?", [id]),
     listPeople: (groupId: number) =>
       queryAll<PersonRow>(db, "SELECT * FROM participants WHERE group_id = ? ORDER BY id", [groupId]),
-    removePerson: async (id: number, groupId: number) =>
-      (await execute(db, "DELETE FROM participants WHERE id = ? AND group_id = ?", [id, groupId])) > 0,
+    removePerson: async (id: number, groupId: number) => {
+      if (!isPostgres(db)) {
+        return db.transaction(() => {
+          const group = db.query("SELECT drawn_at FROM groups WHERE id = ?").get(groupId) as { drawn_at: number | null } | null;
+          if (!group) throw new HttpError(404, "Grupo não encontrado.");
+          if (group.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
+          return db.query("DELETE FROM participants WHERE id = ? AND group_id = ?").run(id, groupId).changes > 0;
+        }).immediate();
+      }
+      return db.sql.begin(async (tx) => {
+        const groups = await tx.unsafe<Row[]>("SELECT drawn_at FROM groups WHERE id = $1 FOR UPDATE", [groupId]);
+        if (!groups.length) throw new HttpError(404, "Grupo não encontrado.");
+        if (groups[0]!.drawn_at !== null) throw new HttpError(409, "O sorteio já foi feito.");
+        const result = await tx.unsafe<Row[]>("DELETE FROM participants WHERE id = $1 AND group_id = $2", [id, groupId]);
+        return (result.count ?? 0) > 0;
+      });
+    },
     setWishes: async (id: number, wishes: string) => {
       await execute(db, "UPDATE participants SET wishes = ? WHERE id = ?", [wishes, id]);
+    },
+    setPhone: async (id: number, phone: string) => {
+      await execute(db, "UPDATE participants SET phone = ? WHERE id = ?", [phone, id]);
     },
     giverOf: (personId: number) => queryOne<PersonRow>(db, "SELECT * FROM participants WHERE giftee_id = ?", [personId]),
     reveal: async (id: number, ts: number) => {

@@ -39,7 +39,7 @@
   }
 
   const abs = (path) => location.origin + path;
-  const waLink = (msg) => "https://wa.me/?text=" + encodeURIComponent(msg);
+  const waLink = (msg, phone) => "https://wa.me/" + (phone ? encodeURIComponent(phone) : "") + "?text=" + encodeURIComponent(msg);
   const fmtDate = (iso) => (iso ? iso.split("-").reverse().join("/") : "");
   const fmtTime = (s) =>
     new Date(s * 1000).toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -102,13 +102,14 @@
   const copyButton = (value, label) =>
     h("button", { type: "button", class: "btn ghost sm", onclick: () => copyText(value) }, label || "Copiar link");
 
-  const waButton = (message, label) =>
-    h("a", { class: "btn green sm", href: waLink(message), target: "_blank", rel: "noopener noreferrer" }, label || "WhatsApp");
+  const waButton = (message, label, phone) =>
+    h("a", { class: "btn green sm", href: waLink(message, phone), target: "_blank", rel: "noopener noreferrer" }, label || "WhatsApp");
 
   const field = (label, input, hint) =>
     h("label", { class: "field" }, h("span", { class: "label" }, label), input, hint && h("span", { class: "hint" }, hint));
 
   const textInput = (props) => h("input", { type: "text", autocomplete: "off", maxlength: 60, ...props });
+  const phoneInput = (props) => h("input", { type: "tel", inputmode: "tel", autocomplete: "tel", maxlength: 32, ...props });
   const area = (props, value) => h("textarea", { maxlength: 300, ...props }, value || "");
 
   /** Lembra, neste aparelho, os links que a pessoa já usou (para voltar depois). */
@@ -163,7 +164,11 @@
     const saved = mem.load();
 
     const participates = h("input", { type: "checkbox", name: "participates", checked: true });
-    const nameBox = h("div", {}, field("Seu nome", textInput({ name: "organizerName", maxlength: 40, placeholder: "Como seus amigos te chamam" })));
+    const organizerPhone = phoneInput({ name: "phone", placeholder: "+55 11 99999-9999", "aria-label": "WhatsApp do organizador (opcional)" });
+    const nameBox = h("div", { class: "stack" },
+      field("Seu nome", textInput({ name: "organizerName", maxlength: 40, placeholder: "Como seus amigos te chamam" })),
+      field("WhatsApp (opcional)", organizerPhone, "Use DDD + número ou inclua o código do país. Você confirma o envio do seu link no WhatsApp."),
+    );
     participates.addEventListener("change", () => { nameBox.hidden = !participates.checked; });
 
     const submit = h("button", { class: "btn block", type: "submit" }, "Criar grupo", h("span", { class: "btn-arrow", "aria-hidden": true }, "→"));
@@ -200,6 +205,7 @@
           name: f.get("name"),
           organizerParticipates: participates.checked,
           organizerName: f.get("organizerName"),
+          phone: f.get("phone"),
           amount: f.get("amount"),
           eventDate: f.get("eventDate"),
           location: f.get("location"),
@@ -260,7 +266,7 @@
             h("ol", { class: "steps" },
               h("li", {}, h("span", {}, h("b", {}, "Crie o grupo "), "e receba o link de convite.")),
               h("li", {}, h("span", {}, h("b", {}, "Chame a turma: "), "cada um entra e deixa suas dicas de presente.")),
-              h("li", {}, h("span", {}, h("b", {}, "Sorteie! "), "Cada pessoa recebe um link secreto e descobre quem tirou. Nem você, organizador, vê.")),
+              h("li", {}, h("span", {}, h("b", {}, "Sorteie! "), "Prepare o envio individual do link de cada pessoa pelo WhatsApp. Nem você, organizador, vê quem tirou quem.")),
             ),
           ),
           saved.length ? savedList(saved) : null,
@@ -357,13 +363,14 @@
     const form = h("form", { class: "card stack", novalidate: true },
       field("Seu nome", textInput({ name: "name", maxlength: 40, placeholder: "Como a turma te conhece", required: true })),
       field("Dicas de presente (opcional)", area({ name: "wishes", placeholder: "Ex.: gosto de livros, chocolate, meias" }), "Quem te tirar vai ver isso."),
+      field("WhatsApp (opcional)", phoneInput({ name: "phone", placeholder: "+55 11 99999-9999" }), "Use DDD + número ou inclua o código do país. O organizador poderá preparar o envio do seu link secreto."),
       submit,
     );
     form.addEventListener("submit", (e) => {
       e.preventDefault();
       const f = new FormData(form);
       run(submit, async () => {
-        const r = await api("POST", `/invite/${code}/join`, { name: f.get("name"), wishes: f.get("wishes") });
+        const r = await api("POST", `/invite/${code}/join`, { name: f.get("name"), wishes: f.get("wishes"), phone: f.get("phone") });
         mem.save({ kind: "p", path: "/p/" + r.participantToken, name: d.group.name, invite: location.pathname });
         toast("Você entrou! Guarde este link 🎄");
         navigate("/p/" + r.participantToken);
@@ -403,6 +410,7 @@
 
     const inviteUrl = () => abs("/g/" + d.group.inviteCode);
     const personUrl = (p) => abs("/p/" + p.token);
+    const secretMessage = (p) => `Oi, ${p.name}! 🎅 O sorteio do amigo secreto "${d.group.name}" foi feito. Seu link secreto: ${personUrl(p)}`;
 
     function paint() {
       document.title = d.group.name + " · Organizador";
@@ -440,13 +448,14 @@
       /* participantes */
       const addName = textInput({ name: "name", maxlength: 40, placeholder: "Nome", "aria-label": "Nome da pessoa" });
       const addWishes = textInput({ name: "wishes", maxlength: 300, placeholder: "Dicas de presente (opcional)", "aria-label": "Dicas de presente" });
+      const addPhone = phoneInput({ name: "phone", placeholder: "WhatsApp (opcional)", "aria-label": "WhatsApp da pessoa (opcional)" });
       const addBtn = h("button", { class: "btn", type: "submit" }, "Adicionar");
-      const addForm = h("form", { class: "stack", novalidate: true }, addName, addWishes, addBtn);
+      const addForm = h("form", { class: "stack", novalidate: true }, addName, addWishes, addPhone, addBtn);
       addForm.addEventListener("submit", (e) => {
         e.preventDefault();
         run(addBtn, async () => {
           focusAdd = true;
-          await call("POST", "/participants", { name: addName.value, wishes: addWishes.value });
+          await call("POST", "/participants", { name: addName.value, wishes: addWishes.value, phone: addPhone.value });
         });
       });
 
@@ -461,12 +470,9 @@
               drawn
                 ? h("div", { class: "actions" },
                     h("span", { class: "badge " + (p.revealed ? "ok" : "") }, p.revealed ? "✓ já viu" : "ainda não viu"),
-                    p.isOrganizer
-                      ? h("a", { class: "btn green sm", href: "/p/" + p.token, "data-link": true }, "Ver o meu")
-                      : [
-                          copyButton(personUrl(p)),
-                          waButton(`Oi, ${p.name}! 🎅 O sorteio do amigo secreto "${d.group.name}" foi feito. Seu link secreto: ${personUrl(p)}`),
-                        ],
+                    p.isOrganizer && h("a", { class: "btn ghost sm", href: "/p/" + p.token, "data-link": true }, "Abrir meu link"),
+                    copyButton(personUrl(p), "Copiar link secreto"),
+                    waButton(secretMessage(p), p.phone ? "Preparar WhatsApp" : "Escolher contato", p.phone),
                   )
                 : h("button", {
                     type: "button", class: "btn ghost sm", "aria-label": "Remover " + p.name,
@@ -540,7 +546,7 @@
         });
         drawCard = h("section", { class: "card stack success" },
           h("h2", {}, "3. Sorteio feito! 🎉"),
-          h("p", {}, "Agora é só mandar para cada pessoa o link dela (botões acima). Cada um descobre quem tirou ao abrir o próprio link."),
+          h("p", {}, "Prepare uma mensagem individual para cada pessoa nos botões acima. O WhatsApp abrirá com o link secreto preenchido; confira o destinatário e confirme o envio por lá. Cada pessoa recebe somente o próprio link."),
           h("p", { class: "muted" }, `${people.filter((p) => p.revealed).length} de ${people.length} já viram o resultado.`),
           redo,
         );
@@ -730,6 +736,25 @@
       );
     };
 
+    const phoneCard = () => {
+      const input = phoneInput({ name: "phone", placeholder: "+55 11 99999-9999", value: d.me.phone || "" });
+      const save = h("button", { class: "btn sm", type: "submit" }, "Salvar WhatsApp");
+      const form = h("form", { class: "stack", novalidate: true },
+        field("WhatsApp (opcional)", input, "Você pode incluir seu DDD ou o código do país. O número fica visível apenas para você e para o organizador, para preparar o envio do seu link secreto."),
+        save,
+      );
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        run(save, async () => {
+          const result = await api("PATCH", "/me/" + token, { phone: input.value });
+          d.me.phone = result.phone;
+          input.value = result.phone;
+          toast(result.phone ? "WhatsApp salvo ✓" : "WhatsApp removido ✓");
+        });
+      });
+      return h("section", { class: "card stack" }, h("h2", {}, "Meu WhatsApp"), form);
+    };
+
     /* --- desenho da tela --- */
     function paint(animate) {
       $thread = null;
@@ -740,6 +765,7 @@
         d.group.note && h("p", { class: "note" }, d.group.note),
         !d.drawn ? waiting() : !d.revealed ? giftCard() : [resultCard(animate), messagesCard()],
         wishesCard(),
+        phoneCard(),
         h("p", { class: "center" }, h("a", { href: "/", "data-link": true }, "Criar meu próprio grupo")),
       );
       if (d.drawn && d.revealed) { paintThread(); loadMessages(); }

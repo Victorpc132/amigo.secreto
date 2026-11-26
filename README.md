@@ -4,6 +4,7 @@ Site de amigo secreto leve, rápido e sem cadastro. Funciona bem no celular.
 
 - Quem organiza cria o grupo, manda o **link de convite** e sorteia.
 - Cada pessoa recebe um **link secreto** e descobre quem tirou. Nem o organizador vê o resultado.
+- Depois do sorteio, o organizador pode preparar o envio individual de cada link pelo WhatsApp; cada mensagem é revisada e enviada manualmente.
 - Tem **dicas de presente**, **mensagens anônimas** entre quem tirou e quem foi tirado, e **restrições** (ex.: casais não se tiram).
 
 ## Rodar no seu computador
@@ -51,6 +52,8 @@ Se não definir nada, já funciona. Em hospedagem você pode definir:
 - Não existe login. Cada link tem um código longo e impossível de adivinhar.
 - O **link do organizador** controla o grupo: quem o tiver pode editar ou apagar. Não compartilhe.
 - O **link pessoal** de cada participante mostra só quem aquela pessoa tirou.
+- O telefone/WhatsApp é opcional. Se informado, o site o normaliza para uso em links `wa.me` e o exibe somente no perfil da própria pessoa e no painel do organizador; ele não aparece nos convites públicos. O organizador pode abrir uma conversa individual com o link secreto já preenchido, mas o envio depende de confirmação manual. Nunca envie vários links secretos juntos em uma mensagem de grupo.
+- O participante pode atualizar ou apagar o próprio WhatsApp pela página do link pessoal.
 - O resultado do sorteio fica guardado no banco de dados. Quem administra esse banco tecnicamente pode ler os dados. Para uma turma de amigos e família isso costuma ser aceitável, mas vale saber.
 - Por padrão, os grupos não expiram. Se definir `RETENTION_DAYS` como um número maior que zero, grupos mais antigos que esse limite serão apagados automaticamente.
 

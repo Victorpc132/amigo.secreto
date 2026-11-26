@@ -3,7 +3,7 @@ import { createRepo, type AppDatabase, type GroupRow, type PersonRow } from "./d
 import { drawNames } from "./draw";
 import { RateLimiter } from "./ratelimit";
 import { StaticFiles } from "./static";
-import { HttpError, escapeHtml, isoDate, text } from "./util";
+import { HttpError, escapeHtml, isoDate, normalizeWhatsApp, text } from "./util";
 
 /* ------------------------------------------------------------------ *
  * Aqui ficam as rotas da API e a entrega das páginas.
@@ -142,7 +142,7 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
     ]);
     return {
       group: publicGroup(g),
-      me: { name: p.name, wishes: p.wishes, isOrganizer: p.is_organizer === 1 },
+      me: { name: p.name, wishes: p.wishes, phone: p.phone, isOrganizer: p.is_organizer === 1 },
       count: people.length,
       drawn: g.drawn_at !== null,
       revealed: p.revealed_at !== null,
@@ -169,6 +169,7 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
         ? {
             name: text(b.organizerName, "seu nome", { min: 1, max: 40 }),
             wishes: wishesOf(b.wishes),
+            phone: normalizeWhatsApp(b.phone),
           }
         : null;
       const { group, person } = await repo.createGroup(fields, organizer, nowSec());
@@ -193,7 +194,8 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
       const g = await inviteGroup(c.params.code!);
       notDrawn(g);
       const name = text(b.name, "seu nome", { min: 1, max: 40 });
-      const person = await repo.addPersonWithinLimit(g.id, name, wishesOf(b.wishes), false, nowSec(), config.maxParticipants);
+      const phone = normalizeWhatsApp(b.phone);
+      const person = await repo.addPersonWithinLimit(g.id, name, wishesOf(b.wishes), phone, false, nowSec(), config.maxParticipants);
       return json({ participantToken: person.token }, 201);
     },
     { name: "join", max: 20, windowMs: 3_600_000 },
@@ -212,6 +214,7 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
         id: p.id,
         name: p.name,
         wishes: p.wishes,
+        phone: p.phone,
         token: p.token,
         isOrganizer: p.is_organizer === 1,
         revealed: p.revealed_at !== null,
@@ -243,7 +246,8 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
     const g = await adminGroup(c.params.token!);
     notDrawn(g);
     const name = text(b.name, "o nome", { min: 1, max: 40 });
-    await repo.addPersonWithinLimit(g.id, name, wishesOf(b.wishes), false, nowSec(), config.maxParticipants);
+    const phone = normalizeWhatsApp(b.phone);
+    await repo.addPersonWithinLimit(g.id, name, wishesOf(b.wishes), phone, false, nowSec(), config.maxParticipants);
     return json({ ok: true }, 201);
   });
 
@@ -281,14 +285,7 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
 
   route("POST", "/api/admin/:token/draw", async (c) => {
     const g = await adminGroup(c.params.token!);
-    notDrawn(g);
-    const people = await repo.listPeople(g.id);
-    if (people.length < 3) throw new HttpError(422, "Precisa de pelo menos 3 pessoas para sortear.");
-    const result = drawNames(people.map((p) => p.id), await repo.listExclusions(g.id));
-    if (!result) {
-      throw new HttpError(422, "Com essas restrições não dá para sortear. Tire alguma restrição e tente de novo.");
-    }
-    await repo.applyDraw(g.id, result, nowSec());
+    await repo.drawGroup(g.id, nowSec(), (people, exclusions) => drawNames(people, exclusions));
     return json({ ok: true });
   });
 
@@ -309,8 +306,10 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
   route("PATCH", "/api/me/:token", async (c) => {
     const b = await c.body();
     const { person } = await meCtx(c.params.token!);
-    await repo.setWishes(person.id, wishesOf(b.wishes));
-    return json({ ok: true });
+    if (Object.hasOwn(b, "wishes")) await repo.setWishes(person.id, wishesOf(b.wishes));
+    const phone = Object.hasOwn(b, "phone") ? normalizeWhatsApp(b.phone) : undefined;
+    if (phone !== undefined) await repo.setPhone(person.id, phone);
+    return json({ ok: true, ...(phone !== undefined ? { phone } : {}) });
   });
 
   route("POST", "/api/me/:token/reveal", async (c) => {
