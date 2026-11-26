@@ -367,12 +367,45 @@ export function createRepo(db: AppDatabase) {
       isPostgres(db)
         ? addPersonPostgres(db.sql, groupId, name, wishes, isOrganizer, ts)
         : Promise.resolve(addPersonSqlite(db, groupId, name, wishes, isOrganizer, ts)),
+    addPersonWithinLimit: async (
+      groupId: number,
+      name: string,
+      wishes: string,
+      isOrganizer: boolean,
+      ts: number,
+      maxParticipants: number,
+    ) => {
+      const fullError = () => new HttpError(409, `O grupo já tem o máximo de ${maxParticipants} pessoas.`);
+      if (!isPostgres(db)) {
+        return db.transaction(() => {
+          const row = db.query("SELECT COUNT(*) AS n FROM participants WHERE group_id = ?").get(groupId) as { n: number };
+          if (row.n >= maxParticipants) throw fullError();
+          return addPersonSqlite(db, groupId, name, wishes, isOrganizer, ts);
+        })();
+      }
+
+      return db.sql.begin(async (tx) => {
+        const groups = await tx.unsafe<Row[]>("SELECT id FROM groups WHERE id = $1 FOR UPDATE", [groupId]);
+        if (!groups.length) throw new HttpError(404, "Convite não encontrado (ou o grupo foi apagado).");
+        const rows = await tx.unsafe<Row[]>(
+          "SELECT CAST(COUNT(*) AS INTEGER) AS n FROM participants WHERE group_id = $1",
+          [groupId],
+        );
+        if (Number(rows[0]?.n ?? 0) >= maxParticipants) throw fullError();
+        return addPersonPostgres(tx, groupId, name, wishes, isOrganizer, ts);
+      });
+    },
     setExclusions,
     applyDraw,
     resetDraw,
     groupByAdmin: (token: string) => queryOne<GroupRow>(db, "SELECT * FROM groups WHERE admin_token = ?", [token]),
     groupByInvite: (code: string) => queryOne<GroupRow>(db, "SELECT * FROM groups WHERE invite_code = ?", [code]),
     groupById: (id: number) => queryOne<GroupRow>(db, "SELECT * FROM groups WHERE id = ?", [id]),
+    rotateInviteCode: async (id: number) => {
+      const code = newInviteCode();
+      await execute(db, "UPDATE groups SET invite_code = ? WHERE id = ?", [code, id]);
+      return code;
+    },
     updateGroup: async (id: number, f: GroupFields) => {
       await execute(
         db,

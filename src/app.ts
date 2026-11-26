@@ -130,12 +130,6 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
     if (g.drawn_at) throw new HttpError(409, "O sorteio já foi feito. Refaça o sorteio se quiser mudar a lista.");
   };
 
-  const capacity = async (g: GroupRow) => {
-    if ((await repo.listPeople(g.id)).length >= config.maxParticipants) {
-      throw new HttpError(409, `O grupo já tem o máximo de ${config.maxParticipants} pessoas.`);
-    }
-  };
-
   const mePayload = async (p: PersonRow, g: GroupRow) => {
     const [giftee, giver, people] = await Promise.all([
       p.giftee_id ? repo.personById(p.giftee_id) : null,
@@ -198,9 +192,8 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
       const b = await c.body();
       const g = await inviteGroup(c.params.code!);
       notDrawn(g);
-      await capacity(g);
       const name = text(b.name, "seu nome", { min: 1, max: 40 });
-      const person = await repo.addPerson(g.id, name, wishesOf(b.wishes), false, nowSec());
+      const person = await repo.addPersonWithinLimit(g.id, name, wishesOf(b.wishes), false, nowSec(), config.maxParticipants);
       return json({ participantToken: person.token }, 201);
     },
     { name: "join", max: 20, windowMs: 3_600_000 },
@@ -234,6 +227,12 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
     return json({ ok: true });
   });
 
+  route("POST", "/api/admin/:token/invite/rotate", async (c) => {
+    const g = await adminGroup(c.params.token!);
+    notDrawn(g);
+    return json({ inviteCode: await repo.rotateInviteCode(g.id) });
+  });
+
   route("DELETE", "/api/admin/:token", async (c) => {
     await repo.deleteGroup((await adminGroup(c.params.token!)).id);
     return json({ ok: true });
@@ -243,9 +242,8 @@ export function createApp(db: AppDatabase, config: Config, opts: AppOptions = {}
     const b = await c.body();
     const g = await adminGroup(c.params.token!);
     notDrawn(g);
-    await capacity(g);
     const name = text(b.name, "o nome", { min: 1, max: 40 });
-    await repo.addPerson(g.id, name, wishesOf(b.wishes), false, nowSec());
+    await repo.addPersonWithinLimit(g.id, name, wishesOf(b.wishes), false, nowSec(), config.maxParticipants);
     return json({ ok: true }, 201);
   });
 

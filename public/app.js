@@ -65,7 +65,11 @@
     }
     let data = null;
     try { data = await res.json(); } catch { /* resposta sem JSON */ }
-    if (!res.ok) throw new Error((data && data.error) || "Algo deu errado. Tente de novo.");
+    if (!res.ok) {
+      const error = new Error((data && data.error) || "Algo deu errado. Tente de novo.");
+      error.status = res.status;
+      throw error;
+    }
     return data;
   }
 
@@ -314,8 +318,21 @@
     try { d = await api("GET", "/invite/" + code); } catch (e) { if (g === gen) viewError(e.message); return; }
     if (g !== gen) return;
 
+    let already = mem.load().find((x) => x.invite === location.pathname && x.kind === "p");
+    let removedBefore = false;
+    if (already) {
+      try {
+        await api("GET", "/me/" + already.path.replace(/^\/p\//, ""));
+      } catch (e) {
+        if (e.status !== 404) { if (g === gen) viewError(e.message); return; }
+        mem.remove(already.path);
+        already = null;
+        removedBefore = true;
+      }
+      if (g !== gen) return;
+    }
+
     document.title = "Convite: " + d.group.name;
-    const already = mem.load().find((x) => x.invite === location.pathname);
 
     const head = [
       h("section", { class: "hero" },
@@ -352,7 +369,7 @@
         navigate("/p/" + r.participantToken);
       });
     });
-    show(head, form);
+    show(head, removedBefore && h("p", { class: "notice" }, "Seu acesso anterior foi removido. Você pode entrar novamente com este convite."), form);
   }
 
   /* ---------- Organizador ---------- */
@@ -401,6 +418,21 @@
           h("div", { class: "row wrap" },
             copyButton(inviteUrl(), "Copiar convite"),
             waButton(`Vamos fazer o amigo secreto "${d.group.name}"! 🎁 Entre pelo link e deixe suas dicas de presente: ${inviteUrl()}`, "Enviar no WhatsApp"),
+          ),
+          h("div", { class: "invite-renew" },
+            h("p", { class: "hint" }, "O link foi compartilhado com alguém que não deveria entrar? Gere outro para invalidar este."),
+            h("button", {
+              type: "button", class: "btn ghost sm",
+              onclick: (e) => {
+                if (!confirm("Gerar outro convite? O link atual deixará de funcionar para todos.")) return;
+                run(e.currentTarget, async () => {
+                  const result = await api("POST", "/admin/" + token + "/invite/rotate");
+                  d.group.inviteCode = result.inviteCode;
+                  toast("Novo convite gerado. O anterior foi invalidado.");
+                  await reload();
+                });
+              },
+            }, "Gerar outro convite"),
           ),
         ],
       );
@@ -575,7 +607,16 @@
   async function viewMe(token) {
     const g = gen;
     let d;
-    try { d = await api("GET", "/me/" + token); } catch (e) { if (g === gen) viewError(e.message); return; }
+    try { d = await api("GET", "/me/" + token); } catch (e) {
+      if (g !== gen) return;
+      const saved = e.status === 404 && mem.load().find((x) => x.path === "/p/" + token && x.kind === "p");
+      if (saved) {
+        mem.remove(saved.path);
+        if (saved.invite) { navigate(saved.invite); return; }
+      }
+      viewError(e.message);
+      return;
+    }
     if (g !== gen) return;
 
     mem.save({ kind: "p", path: "/p/" + token, name: d.group.name });

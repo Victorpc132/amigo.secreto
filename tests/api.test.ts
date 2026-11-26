@@ -18,8 +18,8 @@ describe("retenção de grupos", () => {
   });
 });
 
-function setup(rateLimit = false) {
-  const handle = createApp(openDb(":memory:"), config, { rateLimit });
+function setup(rateLimit = false, maxParticipants = config.maxParticipants) {
+  const handle = createApp(openDb(":memory:"), { ...config, maxParticipants }, { rateLimit });
   const call = async (method: string, path: string, body?: unknown, ip = "9.9.9.9") => {
     const res = await handle(
       new Request(`http://teste${path}`, {
@@ -51,6 +51,58 @@ function setup(rateLimit = false) {
 }
 
 describe("fluxo completo", () => {
+  test("participante removido perde o link pessoal e pode entrar novamente pelo convite", async () => {
+    const { call, makeGroup } = setup();
+    const { adminToken, inviteCode, tokens } = await makeGroup();
+    const admin = await call("GET", `/api/admin/${adminToken}`);
+    const anaId = admin.data.participants.find((p: any) => p.name === "Ana").id;
+
+    expect((await call("DELETE", `/api/admin/${adminToken}/participants/${anaId}`)).status).toBe(200);
+    expect((await call("GET", `/api/me/${tokens.Ana}`)).status).toBe(404);
+
+    const invite = await call("GET", `/api/invite/${inviteCode}`);
+    expect(invite.status).toBe(200);
+    const rejoin = await call("POST", `/api/invite/${inviteCode}/join`, { name: "Ana", wishes: "novas dicas" });
+    expect(rejoin.status).toBe(201);
+    expect(rejoin.data.participantToken).not.toBe(tokens.Ana);
+  });
+
+  test("organizador pode girar o convite e invalidar o link anterior", async () => {
+    const { call, makeGroup } = setup();
+    const { adminToken, inviteCode } = await makeGroup();
+
+    const rotated = await call("POST", `/api/admin/${adminToken}/invite/rotate`);
+    expect(rotated.status).toBe(200);
+    expect(rotated.data.inviteCode).not.toBe(inviteCode);
+    expect((await call("GET", `/api/invite/${inviteCode}`)).status).toBe(404);
+    expect((await call("GET", `/api/invite/${rotated.data.inviteCode}`)).status).toBe(200);
+    expect((await call("POST", `/api/invite/${inviteCode}/join`, { name: "Atrasado" })).status).toBe(404);
+    expect((await call("POST", `/api/invite/${rotated.data.inviteCode}/join`, { name: "Atrasado" })).status).toBe(201);
+  });
+
+  test("rotação do convite é restrita ao organizador e bloqueada após o sorteio", async () => {
+    const { call, makeGroup } = setup();
+    const { adminToken, inviteCode, tokens } = await makeGroup();
+    expect((await call("POST", `/api/admin/${tokens.Ana}/invite/rotate`)).status).toBe(404);
+    await call("POST", `/api/admin/${adminToken}/draw`);
+    expect((await call("POST", `/api/admin/${adminToken}/invite/rotate`)).status).toBe(409);
+    expect((await call("GET", `/api/invite/${inviteCode}`)).status).toBe(200);
+  });
+
+  test("duas entradas simultâneas não excedem o limite do grupo", async () => {
+    const { call } = setup(false, 3);
+    const created = await call("POST", "/api/groups", { name: "Pequeno", organizerName: "Dona" });
+    const { inviteCode, adminToken } = created.data;
+    expect((await call("POST", `/api/invite/${inviteCode}/join`, { name: "Convidado" })).status).toBe(201);
+
+    const results = await Promise.all([
+      call("POST", `/api/invite/${inviteCode}/join`, { name: "Pessoa A" }),
+      call("POST", `/api/invite/${inviteCode}/join`, { name: "Pessoa B" }),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual([201, 409]);
+    expect((await call("GET", `/api/admin/${adminToken}`)).data.participants).toHaveLength(3);
+  });
+
   test("cria, convida, sorteia e cada um descobre alguém diferente", async () => {
     const { call, makeGroup } = setup();
     const { adminToken, tokens } = await makeGroup();
